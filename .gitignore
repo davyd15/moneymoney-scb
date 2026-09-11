@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Internal files, never public
+CLAUDE.md
+.claude/
+moneymoney-api.md
+*.har
+*.swp
+*.bak
+
+# Personal data: bank statements and MoneyMoney exports
+statements/
+*.pdf
+*.csv
+*.plist
+
+# Python
+__pycache__/
+*.pyc
+.venv/
