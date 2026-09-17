@@ -1,0 +1,28 @@
+{
+  "$schema": "https://raw.githubusercontent.com/LuaLS/vscode-lua/master/setting/schema.json",
+  "runtime.version": "Lua 5.4",
+  "diagnostics.globals": [
+    "WebBanking",
+    "MM",
+    "JSON",
+    "HTML",
+    "Connection",
+    "LocalStorage",
+    "url",
+    "version",
+    "description",
+    "services",
+    "ProtocolWebBanking",
+    "AccountTypeCreditCard",
+    "AccountTypeFixedTermDeposit",
+    "AccountTypeGiro",
+    "AccountTypeLoan",
+    "AccountTypeOther",
+    "AccountTypePortfolio",
+    "AccountTypeSavings",
+    "LoginFailed"
+  ],
+  "diagnostics.disable": [
+    "lowercase-global"
+  ]
+}

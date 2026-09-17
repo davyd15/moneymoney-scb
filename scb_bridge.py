@@ -1,0 +1,359 @@
+#!/usr/bin/env python3
+"""scb_bridge.py: local HTTPS bridge between SCB statement PDFs and MoneyMoney.
+
+A MoneyMoney extension can only speak HTTP, and MoneyMoney's App Transport
+Security accepts HTTPS only. So the extension (SCB.lua) talks to this bridge on
+https://127.0.0.1:8766. On every refresh the bridge picks up new statement PDFs
+from an inbox folder, reconciles them (scb_statement.py), keeps every booking
+in a local store and answers the extension's questions: which accounts, which
+balance, which transactions since a date.
+
+Normal operation is a LaunchAgent with socket activation (install.sh): launchd
+holds the port, the bridge starts on the first connection and exits after two
+minutes without requests. Manual start for testing:
+
+    python3 scb_bridge.py --inbox ~/Downloads
+
+Endpoints, all JSON:
+    GET  /__status__                                 alive, version, inbox, accounts
+    POST /refresh   header X-Statement-Password      parse and archive new PDFs
+    GET  /accounts                                   {"accounts": [balance, balance date, ...]}
+    GET  /transactions?account=NNN-NNNNNN-N&since=YYYY-MM-DD   {"balance", "balanceDate", "transactions"}
+
+Data directory ~/Library/Application Support/SCBBridge/:
+    store.json                          every booking ever read, by account and booking id
+    statements/<account>/<from>_<to>.pdf processed statements
+    cert.pem, key.pem                   self-signed certificate for 127.0.0.1
+
+The PDF password arrives with each refresh request and is never written down.
+"""
+
+# Suppress the Dock icon before anything else is imported, otherwise it flashes.
+try:
+    from AppKit import NSApplication, NSApplicationActivationPolicyProhibited  # type: ignore[import-not-found]
+    NSApplication.sharedApplication().setActivationPolicy_(NSApplicationActivationPolicyProhibited)
+except Exception:
+    pass
+
+import argparse
+import ctypes
+import hashlib
+import http.server
+import json
+import os
+import shutil
+import socket
+import socketserver
+import ssl
+import subprocess
+import sys
+import threading
+from datetime import date, datetime
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from scb_statement import Statement, StatementError, parse_pdf
+
+__version__ = "1.0.0"
+
+PORT = 8766
+IDLE_TIMEOUT = 120  # seconds without a request before the bridge exits (launchd restarts it)
+DATA_DIR = Path.home() / "Library" / "Application Support" / "SCBBridge"
+CERT_FILE = DATA_DIR / "cert.pem"
+KEY_FILE = DATA_DIR / "key.pem"
+STORE_FILE = DATA_DIR / "store.json"
+STATEMENTS_DIR = DATA_DIR / "statements"
+DEFAULT_INBOX = DATA_DIR / "inbox"
+PATTERN = "AcctSt*.pdf"  # how the SCB EASY app names every statement, for every account
+
+_idle_timer: threading.Timer | None = None
+_idle_lock = threading.Lock()
+_socket_activated = False  # only then does the bridge exit when idle; a manual start stays up
+
+
+# ── Store ────────────────────────────────────────────────────────────────────
+
+class Store:
+    """All bookings ever read, in one JSON file. Written atomically."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.data = {"version": 1, "accounts": {}}
+        if path.exists():
+            self.data = json.loads(path.read_text())
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.data, indent=1, ensure_ascii=False, sort_keys=True))
+        os.replace(tmp, self.path)
+
+    def absorb(self, statement: Statement, archived: Path) -> int:
+        """Merge one reconciled statement. Returns the number of bookings not seen before."""
+        account = self.data["accounts"].setdefault(statement.account_number, {
+            "owner": "", "type": "savings", "balance": "0.00", "balanceDate": "",
+            "statements": [], "transactions": {},
+        })
+        if statement.owner:
+            account["owner"] = statement.owner
+        account["type"] = statement.account_type
+        if statement.period_end.isoformat() >= account["balanceDate"]:
+            account["balance"] = f"{statement.closing_balance:.2f}"
+            account["balanceDate"] = statement.period_end.isoformat()
+        new = 0
+        for row in statement.rows:
+            entry = row.to_dict(statement.account_number)
+            if entry["id"] not in account["transactions"]:
+                new += 1
+            account["transactions"][entry["id"]] = entry
+        account["statements"].append({
+            "from": statement.period_start.isoformat(),
+            "to": statement.period_end.isoformat(),
+            "file": archived.name,
+            "rows": len(statement.rows),
+            "read": datetime.now().isoformat(timespec="seconds"),
+        })
+        return new
+
+    def accounts(self) -> list[dict]:
+        return [
+            {
+                "accountNumber": number,
+                "owner": a["owner"],
+                "type": a["type"],
+                "currency": "THB",
+                "balance": a["balance"],
+                "balanceDate": a["balanceDate"],
+                "transactions": len(a["transactions"]),
+            }
+            for number, a in sorted(self.data["accounts"].items())
+        ]
+
+    def transactions(self, number: str, since: str) -> list[dict]:
+        account = self.data["accounts"].get(number)
+        if account is None:
+            return []
+        rows = [t for t in account["transactions"].values() if t["bookingDate"] >= since]
+        return sorted(rows, key=lambda t: (t["bookingDate"], t["time"], t["id"]))
+
+
+# ── Statement intake ─────────────────────────────────────────────────────────
+
+def archive(pdf: Path, statement: Statement) -> Path:
+    """Move the PDF to statements/<account>/<from>_<to>.pdf. A byte-identical copy of a
+    statement already archived is simply removed; a differing one for the same period
+    (the bank added late bookings) is kept with a counter."""
+    folder = STATEMENTS_DIR / statement.account_number
+    folder.mkdir(parents=True, exist_ok=True)
+    stem = f"{statement.period_start:%Y-%m-%d}_{statement.period_end:%Y-%m-%d}"
+    digest = hashlib.sha256(pdf.read_bytes()).hexdigest()
+    target = folder / f"{stem}.pdf"
+    counter = 2
+    while target.exists():
+        if hashlib.sha256(target.read_bytes()).hexdigest() == digest:
+            pdf.unlink()
+            return target
+        target = folder / f"{stem}-{counter}.pdf"
+        counter += 1
+    shutil.move(pdf, target)
+    return target
+
+
+def refresh(store: Store, inbox: Path, password: str) -> dict:
+    """Read every statement waiting in the inbox. Files that fail stay where they are."""
+    processed, failed = [], []
+    for pdf in sorted(inbox.glob(PATTERN)):
+        try:
+            statement = parse_pdf(pdf, password)
+        except StatementError as error:
+            failed.append({"file": pdf.name, "error": str(error)})
+            continue
+        except Exception as error:  # a broken file must not take the bridge down
+            failed.append({"file": pdf.name, "error": f"{type(error).__name__}: {error}"})
+            continue
+        archived = archive(pdf, statement)
+        new = store.absorb(statement, archived)
+        processed.append({
+            "file": pdf.name,
+            "account": statement.account_number,
+            "from": statement.period_start.isoformat(),
+            "to": statement.period_end.isoformat(),
+            "rows": len(statement.rows),
+            "new": new,
+            "closingBalance": f"{statement.closing_balance:.2f}",
+            "archived": str(archived),
+        })
+        print(f"Read {pdf.name}: account {statement.account_number}, {statement.period_start} to "
+              f"{statement.period_end}, {len(statement.rows)} rows, {new} new.", flush=True)
+    if processed:
+        store.save()
+    for entry in failed:
+        print(f"Skipped {entry['file']}: {entry['error']}", flush=True)
+    return {"processed": processed, "failed": failed, "accounts": store.accounts()}
+
+
+# ── HTTP ─────────────────────────────────────────────────────────────────────
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    store: Store
+    inbox: Path
+    server_version = f"SCBBridge/{__version__}"
+
+    def log_message(self, _format, *args):
+        print(f"{self.command} {self.path.split('?')[0]} {args[1] if len(args) > 1 else ''}", flush=True)
+
+    def reply(self, status: int, payload) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        _reset_idle_timer(self.server)
+        url = urlparse(self.path)
+        query = parse_qs(url.query)
+        if url.path == "/__status__":
+            # macOS guards Downloads, Desktop and Documents: a background process
+            # needs the user's consent (System Settings, Privacy, Files and Folders).
+            try:
+                os.listdir(self.inbox)
+                inbox_error = ""
+            except OSError as error:
+                inbox_error = f"{type(error).__name__}: {error}"
+            self.reply(200, {
+                "ok": True, "version": __version__, "inbox": str(self.inbox),
+                "inboxError": inbox_error, "accounts": len(self.store.data["accounts"]),
+            })
+        elif url.path == "/accounts":
+            self.reply(200, {"accounts": self.store.accounts()})
+        elif url.path == "/transactions":
+            number = query.get("account", [""])[0]
+            since = query.get("since", ["1970-01-01"])[0]
+            try:
+                date.fromisoformat(since)
+            except ValueError:
+                return self.reply(400, {"error": f"since must be YYYY-MM-DD, got {since!r}"})
+            account = self.store.data["accounts"].get(number)
+            if account is None:
+                return self.reply(404, {"error": f"no statement read yet for account {number}"})
+            self.reply(200, {
+                "account": number, "balance": account["balance"], "balanceDate": account["balanceDate"],
+                "transactions": self.store.transactions(number, since),
+            })
+        else:
+            self.reply(404, {"error": f"unknown path {url.path}"})
+
+    def do_POST(self):
+        _reset_idle_timer(self.server)
+        if urlparse(self.path).path != "/refresh":
+            return self.reply(404, {"error": "unknown path"})
+        password = self.headers.get("X-Statement-Password", "")
+        if not password:
+            return self.reply(400, {"error": "X-Statement-Password header missing"})
+        try:
+            os.listdir(self.inbox)
+        except OSError as error:
+            return self.reply(500, {"error": f"cannot read the inbox folder {self.inbox}: {error}. "
+                                             "Allow Python to access it under System Settings, Privacy, Files and Folders."})
+        self.reply(200, refresh(self.store, self.inbox, password))
+
+
+# ── Process lifetime ─────────────────────────────────────────────────────────
+
+def _reset_idle_timer(server) -> None:
+    """After IDLE_TIMEOUT seconds without a request the bridge exits; launchd restarts it."""
+    global _idle_timer
+    if not _socket_activated:
+        return
+    with _idle_lock:
+        if _idle_timer:
+            _idle_timer.cancel()
+        _idle_timer = threading.Timer(
+            IDLE_TIMEOUT, lambda: threading.Thread(target=server.shutdown, daemon=True).start())
+        _idle_timer.daemon = True
+        _idle_timer.start()
+
+
+def launchd_socket() -> socket.socket | None:
+    """The listening socket launchd already bound for us, if we run under socket activation."""
+    try:
+        lib = ctypes.CDLL("/usr/lib/libSystem.B.dylib")
+        fds = ctypes.POINTER(ctypes.c_int)()
+        count = ctypes.c_size_t(0)
+        if lib.launch_activate_socket(b"Listeners", ctypes.byref(fds), ctypes.byref(count)) != 0 or count.value == 0:
+            return None
+        sock = socket.socket(fileno=fds[0])
+        lib.free(fds)
+        return sock
+    except Exception:
+        return None
+
+
+class PreBoundHTTPServer(http.server.HTTPServer):
+    """An HTTPServer on a socket launchd has already bound and put into listen state."""
+
+    def __init__(self, sock, handler):
+        socketserver.BaseServer.__init__(self, sock.getsockname(), handler)
+        self.socket = sock
+
+
+def ensure_tls_cert() -> None:
+    """Self-signed certificate for 127.0.0.1, created once. install.sh adds it to the Keychain."""
+    if CERT_FILE.exists() and KEY_FILE.exists():
+        return
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    subprocess.run([
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+        "-keyout", str(KEY_FILE), "-out", str(CERT_FILE), "-subj", "/CN=127.0.0.1",
+        "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost",
+        "-addext", "basicConstraints=critical,CA:FALSE",
+        "-addext", "keyUsage=digitalSignature,keyEncipherment",
+        "-addext", "extendedKeyUsage=serverAuth",
+    ], check=True, capture_output=True)
+    os.chmod(KEY_FILE, 0o600)
+    print(f"Created {CERT_FILE}", flush=True)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Local HTTPS bridge between SCB statement PDFs and MoneyMoney.")
+    parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX,
+                        help=f"folder the statement PDFs arrive in (default: {DEFAULT_INBOX})")
+    parser.add_argument("--init-cert", action="store_true", help="create the certificate and exit")
+    parser.add_argument("--version", action="version", version=__version__)
+    args = parser.parse_args()
+
+    ensure_tls_cert()
+    if args.init_cert:
+        return 0
+    inbox = args.inbox.expanduser()
+    inbox.mkdir(parents=True, exist_ok=True)
+
+    Handler.store = Store(STORE_FILE)
+    Handler.inbox = inbox
+    tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    tls.load_cert_chain(CERT_FILE, KEY_FILE)
+
+    global _socket_activated
+    sock = launchd_socket()
+    if sock:
+        _socket_activated = True
+        server = PreBoundHTTPServer(tls.wrap_socket(sock, server_side=True), Handler)
+        _reset_idle_timer(server)
+        mode = f"socket activation, exits after {IDLE_TIMEOUT}s idle"
+    else:
+        server = http.server.HTTPServer(("127.0.0.1", PORT), Handler)
+        server.socket = tls.wrap_socket(server.socket, server_side=True)
+        mode = "manual start, stop with CTRL+C"
+    print(f"SCB bridge {__version__} on https://127.0.0.1:{PORT} ({mode}), inbox {inbox}", flush=True)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    print("SCB bridge stopped.", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
