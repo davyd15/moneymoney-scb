@@ -2,7 +2,7 @@
 
 Imports account statements from **Siam Commercial Bank (SCB) Thailand** into [MoneyMoney](https://moneymoney-app.com) offline accounts. The importer reads the password-protected statement PDFs that the SCB EASY app sends by email and books every transaction through MoneyMoney's AppleScript interface.
 
-> **Status: in development.** No release yet. The approach is settled, the parser is not written.
+> **Status: working, version 0.1.0.** Tested on savings account statements. First real import of a second account still pending, see the changelog.
 
 ---
 
@@ -17,9 +17,25 @@ What SCB does offer, free of charge: an account statement for up to the past 12 
 | Step | What happens |
 |------|--------------|
 | 1 | You request the statement in the SCB EASY app: account, *Other Services*, *Request Account Statement*, period. The PDF arrives by email within minutes. This is the only manual step. |
-| 2 | The importer opens the PDF with the statement password stored in the macOS Keychain and extracts every transaction: date, time, channel, amount, running balance, description, note. |
-| 3 | Reconciliation: the sum of all parsed transactions must match the closing balance printed on the statement. If it does not, nothing is imported. |
-| 4 | Every new transaction is booked into the matching MoneyMoney offline account via AppleScript (`add transaction`). Transactions already present are skipped: the importer reads the account's existing transactions with `export transactions ... as "plist"` and compares date, amount and purpose. |
+| 2 | The importer opens the PDF with the statement password stored in the macOS Keychain (service `scb-statement`) and extracts every row: date, time, transaction code, channel, amount, running balance, description, note. The debit and credit columns collapse into one amount in the extracted text, so the sign comes from the running balance. |
+| 3 | Reconciliation against the statement itself: every row's amount must equal the change of the running balance, and the parsed debit and credit totals and item counts must equal the totals printed on the statement. Any mismatch aborts before MoneyMoney is touched. A layout change at the bank surfaces here instead of as wrong bookings. |
+| 4 | The MoneyMoney account is found by account number, read from the PDF and matched against the account number entered in MoneyMoney. The file name cannot be used: SCB names every statement `AcctSt_<Mon><YY>.pdf`, for every account. |
+| 5 | Only missing transactions are booked via AppleScript (`add transaction`). A transaction counts as present when the account already holds one with the same booking date and amount; the purpose text is ignored so that entries typed in by hand are recognised. The counterparty name is taken from the description (`Transfer to KBNK x3984 Mrs. ...`, `... B/O David Lemke`), the description itself becomes the purpose. MoneyMoney's auto-categorisation applies. |
+| 6 | Balance check: the account balance at the end of the statement period must equal the closing balance of the statement. A difference is reported as a warning, it points at older entries that are missing or wrong. |
+| 7 | The PDF is moved to `statements/<account number>/<from>_<to>.pdf`, so two statements with the same file name never overwrite each other. |
+
+## Usage
+
+```bash
+pip3 install -r requirements.txt
+security add-generic-password -a $USER -s scb-statement -w   # once, asks for the PDF password
+
+python3 scb_import.py ~/Downloads/AcctSt_Sep26.pdf            # import and archive
+python3 scb_import.py --dry-run ~/Downloads/AcctSt_Sep26.pdf  # parse, reconcile, compare, book nothing
+python3 scb_import.py --keep ~/Downloads/AcctSt_Sep26.pdf     # import, leave the file where it is
+```
+
+MoneyMoney has to be running and unlocked. Each SCB account needs an offline account in MoneyMoney with the SCB account number entered in the account settings.
 
 Optional trigger: a mail rule or a folder watcher can start the importer as soon as a new statement PDF arrives.
 
@@ -40,7 +56,7 @@ Optional trigger: a mail rule or a folder watcher can start the importer as soon
 
 | Version | Change |
 |---------|--------|
-| 0.1 (planned) | Parser for SCB savings account statements, reconciliation, AppleScript import with duplicate detection |
+| 0.1.0 | Parser for SCB savings account statements, reconciliation, account matching by account number, AppleScript import with duplicate detection, balance check, archiving. Verified against a statement whose transactions were all entered by hand: 0 booked, balance check passed. |
 
 ## License
 
