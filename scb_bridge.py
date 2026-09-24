@@ -22,6 +22,9 @@ Endpoints, all JSON:
 
 "balance" is null until a statement with at least one transaction has been read
 for the account: SCB prints no balance on a statement without transactions.
+"missingText" names every month that no statement covers yet, counted from the
+start date (or the first statement) to the end of the previous month. A
+forgotten statement would otherwise leave a gap nobody notices.
 
 Data directory ~/Library/Application Support/SCBBridge/:
     store.json                          every booking ever read, by account and booking id
@@ -64,7 +67,7 @@ from urllib.parse import parse_qs, urlparse
 
 from scb_statement import Statement, StatementError, parse_pdf
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 PORT = 8766
 IDLE_TIMEOUT = 120  # seconds without a request before the bridge exits (launchd restarts it)
@@ -76,6 +79,8 @@ CONFIG_FILE = DATA_DIR / "config.json"
 STATEMENTS_DIR = DATA_DIR / "statements"
 DEFAULT_INBOX = DATA_DIR / "inbox"
 PATTERN = "AcctSt*.pdf"  # how the SCB EASY app names every statement, for every account
+MONTHS = ["January", "February", "March", "April", "May", "June",
+          "July", "August", "September", "October", "November", "December"]
 
 _idle_timer: threading.Timer | None = None
 _idle_lock = threading.Lock()
@@ -166,6 +171,26 @@ class Store:
             until = max(later)
         return anchor["closingBalance"], until.isoformat()
 
+    @staticmethod
+    def missing(account: dict, start: str | None, until: date) -> list[tuple[date, date]]:
+        """Periods from the start date (or the first statement) to `until` that no statement covers."""
+        periods = sorted((date.fromisoformat(s["from"]), date.fromisoformat(s["to"])) for s in account["statements"])
+        if not periods:
+            return []
+        first = date.fromisoformat(start) if start else periods[0][0]
+        if until < first:
+            return []
+        gaps = []
+        covered = first - timedelta(days=1)  # every day up to here is covered
+        for begin, end in periods:
+            if begin > covered + timedelta(days=1):
+                gaps.append((covered + timedelta(days=1), min(begin - timedelta(days=1), until)))
+            covered = max(covered, end)
+            if covered >= until:
+                return gaps
+        gaps.append((covered + timedelta(days=1), until))
+        return gaps
+
     def accounts(self) -> list[dict]:
         result = []
         for number, account in sorted(self.data["accounts"].items()):
@@ -189,6 +214,28 @@ class Store:
         first = max(since, start or since)
         rows = [t for t in account["transactions"].values() if t["bookingDate"] >= first]
         return sorted(rows, key=lambda t: (t["bookingDate"], t["time"], t["id"]))
+
+
+def previous_month_end(today: date) -> date:
+    """Statements are requested per calendar month, so the previous month is the last one due."""
+    return today.replace(day=1) - timedelta(days=1)
+
+
+def describe_gaps(gaps: list[tuple[date, date]]) -> str:
+    """'September 2026 (24 to 30 Sep), October 2026': whole months by name, partial ones with their days."""
+    parts = []
+    for begin, end in gaps:
+        month = begin.replace(day=1)
+        while month <= end:
+            last = (month.replace(day=28) + timedelta(days=4)).replace(day=1) - timedelta(days=1)
+            a, b = max(begin, month), min(end, last)
+            label = f"{MONTHS[month.month - 1]} {month.year}"
+            if (a, b) != (month, last):
+                days = f"{a.day}" if a == b else f"{a.day} to {b.day}"
+                label += f" ({days} {MONTHS[month.month - 1][:3]})"
+            parts.append(label)
+            month = last + timedelta(days=1)
+    return ", ".join(parts)
 
 
 def load_config() -> dict:
@@ -308,10 +355,14 @@ class Handler(http.server.BaseHTTPRequestHandler):
             account = self.store.data["accounts"].get(number)
             if account is None:
                 return self.reply(404, {"error": f"no statement read yet for account {number}"})
+            start = load_config().get("start")
             balance, until = self.store.balance(account)
+            gaps = self.store.missing(account, start, previous_month_end(date.today()))
             self.reply(200, {
                 "account": number, "balance": balance, "balanceDate": until,
-                "transactions": self.store.transactions(number, since, load_config().get("start")),
+                "missing": [{"from": a.isoformat(), "to": b.isoformat()} for a, b in gaps],
+                "missingText": describe_gaps(gaps),
+                "transactions": self.store.transactions(number, since, start),
             })
         else:
             self.reply(404, {"error": f"unknown path {url.path}"})

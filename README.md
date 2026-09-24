@@ -2,7 +2,7 @@
 
 A [MoneyMoney](https://moneymoney-app.com) extension for **Siam Commercial Bank (SCB) Thailand**. SCB has no internet banking any more, so the extension reads the password-protected statement PDFs that the SCB EASY app emails on request. Refreshing the account in MoneyMoney picks up new statements, reconciles them and books every transaction.
 
-> **Status: working, version 1.2.** Verified with savings account statements with and without transactions. See the changelog for what has been exercised.
+> **Status: working, version 1.3.** Verified with savings account statements with and without transactions. See the changelog for what has been exercised.
 
 ---
 
@@ -35,6 +35,7 @@ MoneyMoney ──refresh──▶ SCB.lua ──https://127.0.0.1:8766──▶ 
 | 7 | The balance comes from the statement that lists transactions and ends last. A statement for a period without transactions is valid, but SCB prints no balance on it at all; it only carries the known balance forward when it follows on without a gap. As long as no statement with transactions has been read for an account, the extension reports that its balance is not known yet instead of showing one. |
 | 8 | The counterparty name is taken from the description (`Transfer to KBNK x3984 Mrs. ...`, `... B/O David Lemke`). The purpose is the description, the note and the booking time; the time keeps two otherwise identical bookings on the same day apart, which MoneyMoney could discard as duplicates. Channel and code become the booking text. MoneyMoney's auto-categorisation applies. |
 | 9 | With a start date set, bookings before it stay in the store and count for the balance, but are never delivered to MoneyMoney. See below. |
+| 10 | Completeness: every day from the start date (or the first statement) to the end of the previous month must be covered by a statement. If a month is missing, MoneyMoney shows which one (`Statements missing for SCB account ...: September 2026 (24 to 30 Sep)`) and leaves the account as it is until the statement arrives. A forgotten statement cannot leave a silent gap, and at the start of each month the check doubles as a reminder to request the previous month, for quiet accounts too: only a statement without transactions proves that nothing happened. |
 
 Booking dates are anchored at 12:00 UTC so that a time zone change or a DST switch on the Mac never makes MoneyMoney import a day twice.
 
@@ -57,6 +58,8 @@ Then in MoneyMoney:
 2. Reload the extensions (right-click an account, *Reload Extensions*) or restart MoneyMoney.
 3. Add an account and choose the service **SCB Thailand (Statement PDF)**. User name: anything. Password: the password of your statement PDFs. MoneyMoney keeps it; the bridge receives it per refresh and never stores it.
 4. On the first connection MoneyMoney shows the bridge's certificate. Accept it if the SHA-256 fingerprint matches the one the installer printed.
+
+Routine: at the start of each month request the previous month for every account, put the PDFs into the inbox and refresh. A statement for the current month runs until yesterday; overlapping statements never produce duplicates.
 
 Requirements: macOS, MoneyMoney, Python 3.11 or newer with `pypdf` and `cryptography` (the installer installs them). If the inbox is `~/Downloads`, `~/Documents` or `~/Desktop`, macOS may ask once whether Python may access that folder; the extension reports it when access is missing.
 
@@ -101,6 +104,7 @@ The fixtures are synthetic statements that copy the line structure of real ones 
 
 | Version | Change |
 |---------|--------|
+| 1.3 | Completeness check: months without a statement between the start date and the end of the previous month are reported in MoneyMoney by name. Verified with the live store: nothing due on 25 September, the rest of September reported for both accounts on 1 October. |
 | 1.2 | Start date (`--start`, kept in `config.json`) for switching from accounts kept by hand: older bookings count for the balance but are never delivered. The booking time is part of the purpose, so identical bookings on the same day stay apart. Monthly statements documented. Verified with the live bridge: start date applied and kept across a reinstall without `--start`. |
 | 1.1 | Statements for a period without transactions are accepted; SCB prints no balance on them. The balance now comes from the latest statement with transactions and is carried forward by gap-free statements without; an account without a known balance says so in MoneyMoney. Clearer errors (which header field is missing, missing totals). The installer no longer touches the macOS keychain, which MoneyMoney does not use, and prints the certificate fingerprint instead. Unit tests with synthetic statements. Verified with a real statement without transactions and the store written by 1.0. |
 | 1.0 | Extension `SCB.lua` plus local bridge `scb_bridge.py` with socket activation, inbox scanning, stable booking ids, balance from the newest statement, installer and uninstaller. Bridge verified end to end with a real statement (parse, archive, duplicate drop, wrong password, unknown account); the extension logic verified with a stand-in for MoneyMoney's runtime. |

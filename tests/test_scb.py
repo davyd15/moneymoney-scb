@@ -13,7 +13,9 @@ import unittest
 from decimal import Decimal
 from pathlib import Path
 
-from scb_bridge import Store
+from datetime import date
+
+from scb_bridge import Store, describe_gaps, previous_month_end
 from scb_statement import StatementError, parse_lines
 
 HEADER = """ธนาคารไทยพาณิชย์ จำกัด (มหาชน)
@@ -167,6 +169,31 @@ class StoreBalanceTest(unittest.TestCase):
         self.assertEqual(dates, ["2026-09-02"])
         # The balance does not depend on the start date.
         self.assertEqual(Store.balance(self.account()), ("650.00", "2026-09-10"))
+
+    def gaps(self, start, until):
+        return Store.missing(self.account(), start, until)
+
+    def test_no_gap_while_the_statements_reach_the_previous_month(self):
+        self.store.absorb(parse_lines(lines(WITH_ROWS)), Path("busy.pdf"))      # 01.09. to 10.09.
+        self.store.absorb(parse_lines(lines(WITHOUT_ROWS)), Path("quiet.pdf"))  # 11.09. to 23.09.
+        self.assertEqual(self.gaps("2026-09-05", date(2026, 9, 23)), [])
+        # Until the previous month has ended, nothing is due.
+        self.assertEqual(self.gaps("2026-09-16", previous_month_end(date(2026, 9, 25))), [])
+
+    def test_the_rest_of_the_month_is_due_once_it_has_ended(self):
+        self.store.absorb(parse_lines(lines(WITH_ROWS)), Path("busy.pdf"))
+        self.store.absorb(parse_lines(lines(WITHOUT_ROWS)), Path("quiet.pdf"))
+        gaps = self.gaps("2026-09-16", previous_month_end(date(2026, 10, 1)))
+        self.assertEqual(gaps, [(date(2026, 9, 24), date(2026, 9, 30))])
+        self.assertEqual(describe_gaps(gaps), "September 2026 (24 to 30 Sep)")
+
+    def test_a_forgotten_month_in_between_is_found(self):
+        self.store.absorb(parse_lines(lines(WITH_ROWS)), Path("busy.pdf"))  # 01.09. to 10.09.
+        later = WITHOUT_ROWS.replace("11/09/2026 - 23/09/2026", "01/11/2026 - 30/11/2026")
+        self.store.absorb(parse_lines(lines(later)), Path("november.pdf"))
+        gaps = self.gaps(None, date(2026, 11, 30))
+        self.assertEqual(gaps, [(date(2026, 9, 11), date(2026, 10, 31))])
+        self.assertEqual(describe_gaps(gaps), "September 2026 (11 to 30 Sep), October 2026")
 
     def test_store_of_bridge_1_0_is_migrated(self):
         path = Path(self.tmp.name) / "v1.json"

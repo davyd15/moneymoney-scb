@@ -1,11 +1,11 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- SCB (Siam Commercial Bank) Thailand: statement PDFs via local bridge
--- Version: 1.02
+-- Version: 1.03
 --
--- Changes in 1.02:
---  - The protocol shows the bridge's start date: bookings before it are
---    held back because they live in accounts kept by hand.
+-- Changes in 1.03:
+--  - Reports every month without a statement, from the start date to the end
+--    of the previous month, so a forgotten statement cannot leave a silent gap.
 -- ============================================================
 --
 -- SCB closed its internet banking in July 2023 and offers no API, so this
@@ -18,7 +18,7 @@
 -- never stored by the bridge.
 
 WebBanking {
-  version     = 1.02,
+  version     = 1.03,
   url         = "https://127.0.0.1:8766",
   services    = {"SCB Thailand (Statement PDF)"},
   description = "SCB (Siam Commercial Bank) Thailand: imports statement PDFs through a local bridge"
@@ -163,6 +163,13 @@ function RefreshAccount(account, since)
   -- Honouring `since` would leave older statements out after the first refresh.
   local data, err = bridge("GET", "/transactions?account=" .. MM.urlencode(account.accountNumber) .. "&since=1970-01-01")
   if not data then return err end
+
+  -- Every day from the start date to the end of the previous month needs a
+  -- statement; the account stays as it is until the gap is closed.
+  if type(data.missingText) == "string" and data.missingText ~= "" then
+    return "Statements missing for SCB account " .. account.accountNumber .. ": " .. data.missingText ..
+      ". Request them in the SCB EASY app, put the PDFs into the inbox and refresh again."
+  end
 
   -- The bridge knows a balance only from a statement that lists transactions.
   local balance = tonumber(data.balance)
