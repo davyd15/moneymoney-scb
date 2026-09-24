@@ -12,6 +12,10 @@ the whole statement is checked against the totals the bank prints at the end.
 A layout change at the bank surfaces as a StatementError, never as a wrong
 booking.
 
+A statement for a period without transactions is valid but carries no balance
+at all: SCB prints neither a BALANCE BROUGHT FORWARD line nor any row, only
+zero totals. Its opening and closing balance are None.
+
 Shared by scb_bridge.py (MoneyMoney extension) and scb_import.py (offline
 accounts via AppleScript).
 """
@@ -38,6 +42,13 @@ TOTAL_DEBIT = re.compile(r"^TOTAL AMOUNTS \(Debit\)\s+(?P<amount>[\d,]+\.\d{2})$
 TOTAL_CREDIT = re.compile(r"^TOTAL AMOUNTS \(Credit\)\s+(?P<amount>[\d,]+\.\d{2})$")
 TOTAL_ITEMS = re.compile(r"^TOTAL ITEMS\s+(?P<debit>\d+)\s+(?P<credit>\d+)$")
 TITLE = re.compile(r"^STATEMENT OF (?P<type>[A-Z ]+?) ACCOUNT$")
+
+# Page header and footer lines. A wrapped description never continues past one of
+# them: should a page break ever split a transaction, its note is lost instead of
+# the page furniture ending up in its description (which is part of its id).
+PAGE_FURNITURE = re.compile(
+    r"^(ธนาคารไทยพาณิชย์|THE SIAM COMMERCIAL BANK|เอกสารฉบับนี้|This document is auto-generated|หน้า \d+ / \d+)"
+)
 
 # How SCB writes the counterparty into the description. Whatever does not match
 # is booked with the whole description as name, which is still searchable.
@@ -99,17 +110,17 @@ class Statement:
     account_number: str
     period_start: date
     period_end: date
-    opening_balance: Decimal
+    opening_balance: Decimal | None  # None on a statement without transactions: SCB prints no balance then
     owner: str = ""
     account_type: str = "savings"  # "savings" or "current"
     rows: list[Row] = field(default_factory=list)
-    total_debit: Decimal = Decimal(0)
-    total_credit: Decimal = Decimal(0)
-    items_debit: int = 0
-    items_credit: int = 0
+    total_debit: Decimal | None = None
+    total_credit: Decimal | None = None
+    items_debit: int | None = None
+    items_credit: int | None = None
 
     @property
-    def closing_balance(self) -> Decimal:
+    def closing_balance(self) -> Decimal | None:
         return self.rows[-1].balance if self.rows else self.opening_balance
 
 
@@ -146,13 +157,15 @@ def parse_lines(lines: list[str]) -> Statement:
             if index + 1 < len(lines) and re.fullmatch(r"[A-Z][A-Z .'-]+", lines[index + 1]):
                 owner = lines[index + 1].title()
         if period is None and (m := PERIOD.search(line)):
-            period = tuple(datetime.strptime(part, "%d/%m/%Y").date() for part in m.groups())
+            start, end = (datetime.strptime(part, "%d/%m/%Y").date() for part in m.groups())
+            period = (start, end)
         if opening is None and (m := OPENING.search(line)):
             opening = money(m.group("amount"))
         if m := TITLE.match(line):
             account_type = "current" if "CURRENT" in m.group("type") else "savings"
-    if account is None or period is None or opening is None:
-        raise StatementError("Account number, period or opening balance not found. Is this an SCB statement?")
+    missing = [label for label, value in (("account number", account), ("statement period", period)) if value is None]
+    if account is None or period is None:
+        raise StatementError(f"{' and '.join(missing).capitalize()} not found. Is this an SCB account statement?")
 
     statement = Statement(account, period[0], period[1], opening, owner, account_type)
     current: Row | None = None  # the row whose DESC continuation or NOTE line may follow
@@ -177,6 +190,8 @@ def parse_lines(lines: list[str]) -> Statement:
             statement.total_credit = money(m.group("amount"))
         elif m := TOTAL_ITEMS.match(line):
             statement.items_debit, statement.items_credit = int(m.group("debit")), int(m.group("credit"))
+        elif PAGE_FURNITURE.match(line):
+            current = None
         elif current is not None:
             # A long description wraps onto the next line, before the NOTE line.
             current.description = f"{current.description} {re.sub(r'^DESC\s*:\s*', '', line)}".strip()
@@ -188,22 +203,27 @@ def parse_lines(lines: list[str]) -> Statement:
 
 def reconcile(statement: Statement) -> None:
     """Sign every amount from the running balance and prove the statement adds up."""
-    previous = statement.opening_balance
-    for row in statement.rows:
-        delta = row.balance - previous
-        if abs(delta) != row.amount:
-            raise StatementError(
-                f"{row.booking_date} {row.time}: amount {row.amount} does not match the balance "
-                f"change {delta} ({previous} to {row.balance})."
-            )
-        row.amount = delta
-        previous = row.balance
+    if None in (statement.total_debit, statement.total_credit, statement.items_debit, statement.items_credit):
+        raise StatementError("Totals (TOTAL AMOUNTS, TOTAL ITEMS) not found. Has the statement layout changed?")
+    if statement.rows:
+        if statement.opening_balance is None:
+            raise StatementError("Opening balance (BALANCE BROUGHT FORWARD) not found, although the statement lists transactions.")
+        previous = statement.opening_balance
+        for row in statement.rows:
+            delta = row.balance - previous
+            if abs(delta) != row.amount:
+                raise StatementError(
+                    f"{row.booking_date} {row.time}: amount {row.amount} does not match the balance "
+                    f"change {delta} ({previous} to {row.balance})."
+                )
+            row.amount = delta
+            previous = row.balance
 
     debits = [r for r in statement.rows if r.amount < 0]
     credits = [r for r in statement.rows if r.amount > 0]
     checks = {
-        "debit total": (-sum(r.amount for r in debits), statement.total_debit),
-        "credit total": (sum(r.amount for r in credits), statement.total_credit),
+        "debit total": (-sum((r.amount for r in debits), Decimal(0)), statement.total_debit),
+        "credit total": (sum((r.amount for r in credits), Decimal(0)), statement.total_credit),
         "debit items": (len(debits), statement.items_debit),
         "credit items": (len(credits), statement.items_credit),
     }

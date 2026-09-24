@@ -38,7 +38,7 @@ from pathlib import Path
 
 from scb_statement import Row, Statement, StatementError, parse_pdf
 
-__version__ = "0.2.0"
+__version__ = "0.2.1"
 
 KEYCHAIN_SERVICE = "scb-statement"
 ARCHIVE_DIR = Path(__file__).resolve().parent / "statements"
@@ -138,10 +138,15 @@ def archive(pdf: Path, statement: Statement) -> Path:
 
 def process(pdf: Path, password: str, dry_run: bool, keep: bool) -> int:
     statement = parse_pdf(pdf, password)
+    closing = statement.closing_balance
+    balances = (
+        f"opening {statement.opening_balance:,.2f}, closing {closing:,.2f} THB"
+        if closing is not None and statement.opening_balance is not None
+        else "no transactions, so SCB printed no balance"
+    )
     print(
         f"{pdf.name}: account {statement.account_number}, {statement.period_start} to "
-        f"{statement.period_end}, {len(statement.rows)} rows, opening {statement.opening_balance:,.2f}, "
-        f"closing {statement.closing_balance:,.2f} THB, reconciled."
+        f"{statement.period_end}, {len(statement.rows)} rows, {balances}, reconciled."
     )
 
     mm = MoneyMoney()
@@ -164,12 +169,14 @@ def process(pdf: Path, password: str, dry_run: bool, keep: bool) -> int:
     later = mm.transactions(account["uuid"], statement.period_end + timedelta(days=1))
     balance_now = Decimal(str(mm.account_for(statement.account_number)["balance"][0][0]))
     at_period_end = balance_now - sum((Decimal(str(t["amount"])) for t in later), Decimal(0))
-    if at_period_end == statement.closing_balance:
+    if closing is None:
+        print("Balance check skipped: the statement carries no balance.")
+    elif at_period_end == closing:
         print(f"Balance check passed: {at_period_end:,.2f} THB on {statement.period_end}.")
     else:
         print(
             f"WARNING: MoneyMoney holds {at_period_end:,.2f} THB on {statement.period_end}, "
-            f"the statement says {statement.closing_balance:,.2f}. Check the entries before this period."
+            f"the statement says {closing:,.2f}. Check the entries before this period."
         )
 
     if not keep:

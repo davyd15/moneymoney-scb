@@ -5,10 +5,12 @@
 #   ./install.sh                      inbox: ~/Library/Application Support/SCBBridge/inbox
 #   ./install.sh --inbox ~/Downloads  inbox: the folder your mail client saves attachments to
 #
-# Installs the extension into MoneyMoney, the bridge into Application Support,
-# a LaunchAgent that starts the bridge on demand (socket activation) and the
-# bridge's certificate into your login keychain (macOS asks for your password
-# once). Safe to run again: everything is replaced in place.
+# Installs the extension into MoneyMoney, the bridge into Application Support
+# and a LaunchAgent that starts the bridge on demand (socket activation). The
+# bridge's self-signed certificate is created once and kept: MoneyMoney checks
+# certificates itself, asks once on the first refresh and remembers the
+# fingerprint. The macOS keychain plays no part in that. Safe to run again:
+# everything is replaced in place.
 set -euo pipefail
 
 BLUE='\033[0;34m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; RED='\033[0;31m'; BOLD='\033[1m'; NC='\033[0m'
@@ -70,15 +72,8 @@ ok "inbox: $INBOX"
 # ── 3. Certificate ───────────────────────────────────────────────────────────
 step "Certificate for https://127.0.0.1:$PORT..."
 "$PYTHON" "$BRIDGE_DIR/scb_bridge.py" --init-cert >/dev/null
-if security verify-cert -c "$BRIDGE_DIR/cert.pem" -p ssl -n 127.0.0.1 2>/dev/null | grep -q "successful"; then
-    ok "already trusted"
-else
-    echo "  macOS asks for your login password once to trust the bridge's certificate."
-    security add-trusted-cert -r trustRoot -p ssl -k "$HOME/Library/Keychains/login.keychain-db" "$BRIDGE_DIR/cert.pem" \
-        && ok "trusted for TLS on 127.0.0.1" \
-        || warn "Not trusted. MoneyMoney will refuse the bridge until you run:
-     security add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db \"$BRIDGE_DIR/cert.pem\""
-fi
+FINGERPRINT="$(openssl x509 -in "$BRIDGE_DIR/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
+ok "SHA-256 $FINGERPRINT"
 
 # ── 4. LaunchAgent with socket activation ────────────────────────────────────
 step "Installing LaunchAgent..."
@@ -128,6 +123,8 @@ launchctl bootstrap "gui/$(id -u)" "$PLIST" && ok "loaded, listening on 127.0.0.
 echo -e "\n${GREEN}${BOLD}Installation complete.${NC}"
 echo ""
 echo "  1. In MoneyMoney: reload the extensions (right-click an account → Reload Extensions) or restart it."
+echo "     On the first refresh MoneyMoney asks whether to trust the bridge's certificate."
+echo "     Accept it if the SHA-256 fingerprint matches: $FINGERPRINT"
 echo "  2. Add an account: choose the service \"SCB Thailand (Statement PDF)\"."
 echo "     User name: anything. Password: the password of your SCB statement PDFs."
 echo "  3. Request a statement in the SCB EASY app, save the PDF into"

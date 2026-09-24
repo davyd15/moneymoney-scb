@@ -1,10 +1,12 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- SCB (Siam Commercial Bank) Thailand: statement PDFs via local bridge
--- Version: 1.00
+-- Version: 1.01
 --
--- Changes in 1.00:
---  - Initial release
+-- Changes in 1.01:
+--  - Statements without transactions are accepted. SCB prints no balance on
+--    them, so an account whose balance is not known yet says so instead of
+--    showing a balance nobody has read from a statement.
 -- ============================================================
 --
 -- SCB closed its internet banking in July 2023 and offers no API, so this
@@ -17,7 +19,7 @@
 -- never stored by the bridge.
 
 WebBanking {
-  version     = 1.00,
+  version     = 1.01,
   url         = "https://127.0.0.1:8766",
   services    = {"SCB Thailand (Statement PDF)"},
   description = "SCB (Siam Commercial Bank) Thailand: imports statement PDFs through a local bridge"
@@ -162,6 +164,15 @@ function RefreshAccount(account, since)
   local data, err = bridge("GET", "/transactions?account=" .. MM.urlencode(account.accountNumber) .. "&since=1970-01-01")
   if not data then return err end
 
+  -- The bridge knows a balance only from a statement that lists transactions.
+  local balance = tonumber(data.balance)
+  if balance == nil then
+    return "The balance of SCB account " .. account.accountNumber .. " is not known yet: " ..
+      "SCB prints no balance on a statement without transactions, and no statement read so far lists one. " ..
+      "Request a statement over a longer period in the SCB EASY app (up to 12 months) " ..
+      "that contains at least one transaction, put it into the inbox and refresh again."
+  end
+
   local transactions = {}
   local order = {}  -- booking time per entry, only used to sort same-day rows
   for _, t in ipairs(data.transactions or {}) do
@@ -185,7 +196,7 @@ function RefreshAccount(account, since)
   print(string.format("Account %s: balance %s THB as of %s, %d transactions",
     account.accountNumber, tostring(data.balance), tostring(data.balanceDate), #transactions))
   return {
-    balance      = tonumber(data.balance),
+    balance      = balance,
     transactions = transactions,
   }
 end

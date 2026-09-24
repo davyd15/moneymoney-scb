@@ -20,9 +20,10 @@ launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null && ok "LaunchAgent stopped
 rm -f "$PLIST" && ok "LaunchAgent removed"
 rm -f "$EXTENSIONS_DIR/SCB.lua" && ok "SCB.lua removed from MoneyMoney"
 
-if [ -f "$BRIDGE_DIR/cert.pem" ]; then
-    security remove-trusted-cert "$BRIDGE_DIR/cert.pem" 2>/dev/null && ok "certificate trust removed" \
-        || warn "Certificate trust not removed. Delete the certificate \"127.0.0.1\" in Keychain Access if you like."
+# Installs of bridge 1.0 also trusted the certificate in the login keychain.
+if [ -f "$BRIDGE_DIR/cert.pem" ] && security verify-cert -c "$BRIDGE_DIR/cert.pem" -p ssl -n 127.0.0.1 2>/dev/null | grep -q successful; then
+    security remove-trusted-cert "$BRIDGE_DIR/cert.pem" 2>/dev/null && ok "keychain trust from bridge 1.0 removed" \
+        || warn "Keychain trust not removed. Delete the certificate \"127.0.0.1\" in Keychain Access if you like."
 fi
 
 rm -f "$BRIDGE_DIR/scb_bridge.py" "$BRIDGE_DIR/scb_statement.py" "$BRIDGE_DIR/cert.pem" "$BRIDGE_DIR/key.pem"

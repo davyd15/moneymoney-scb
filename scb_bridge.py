@@ -20,6 +20,9 @@ Endpoints, all JSON:
     GET  /accounts                                   {"accounts": [balance, balance date, ...]}
     GET  /transactions?account=NNN-NNNNNN-N&since=YYYY-MM-DD   {"balance", "balanceDate", "transactions"}
 
+"balance" is null until a statement with at least one transaction has been read
+for the account: SCB prints no balance on a statement without transactions.
+
 Data directory ~/Library/Application Support/SCBBridge/:
     store.json                          every booking ever read, by account and booking id
     statements/<account>/<from>_<to>.pdf processed statements
@@ -48,13 +51,13 @@ import ssl
 import subprocess
 import sys
 import threading
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from scb_statement import Statement, StatementError, parse_pdf
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 
 PORT = 8766
 IDLE_TIMEOUT = 120  # seconds without a request before the bridge exits (launchd restarts it)
@@ -74,13 +77,32 @@ _socket_activated = False  # only then does the bridge exit when idle; a manual 
 # ── Store ────────────────────────────────────────────────────────────────────
 
 class Store:
-    """All bookings ever read, in one JSON file. Written atomically."""
+    """All bookings ever read, in one JSON file. Written atomically.
+
+    Per account it keeps the statements read (period, number of rows, closing
+    balance) and every booking under its stable id. The balance is derived from
+    the statements on demand, see balance().
+    """
+
+    VERSION = 2
 
     def __init__(self, path: Path):
         self.path = path
-        self.data = {"version": 1, "accounts": {}}
+        self.data = {"version": self.VERSION, "accounts": {}}
         if path.exists():
-            self.data = json.loads(path.read_text())
+            self.data = self.migrate(json.loads(path.read_text()))
+
+    @staticmethod
+    def migrate(data: dict) -> dict:
+        """Version 1 (bridge 1.0.0) kept one balance per account instead of one per statement."""
+        if data.get("version", 1) < 2:
+            for account in data["accounts"].values():
+                balance, until = account.pop("balance", None), account.pop("balanceDate", "")
+                for record in account["statements"]:
+                    known = record["rows"] > 0 and record["to"] == until
+                    record.setdefault("closingBalance", balance if known else None)
+            data["version"] = 2
+        return data
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,43 +113,65 @@ class Store:
     def absorb(self, statement: Statement, archived: Path) -> int:
         """Merge one reconciled statement. Returns the number of bookings not seen before."""
         account = self.data["accounts"].setdefault(statement.account_number, {
-            "owner": "", "type": "savings", "balance": "0.00", "balanceDate": "",
-            "statements": [], "transactions": {},
+            "owner": "", "type": "savings", "statements": [], "transactions": {},
         })
         if statement.owner:
             account["owner"] = statement.owner
         account["type"] = statement.account_type
-        if statement.period_end.isoformat() >= account["balanceDate"]:
-            account["balance"] = f"{statement.closing_balance:.2f}"
-            account["balanceDate"] = statement.period_end.isoformat()
         new = 0
         for row in statement.rows:
             entry = row.to_dict(statement.account_number)
             if entry["id"] not in account["transactions"]:
                 new += 1
             account["transactions"][entry["id"]] = entry
-        account["statements"].append({
+        closing = statement.closing_balance
+        record = {
             "from": statement.period_start.isoformat(),
             "to": statement.period_end.isoformat(),
             "file": archived.name,
             "rows": len(statement.rows),
+            "closingBalance": None if closing is None else f"{closing:.2f}",
             "read": datetime.now().isoformat(timespec="seconds"),
-        })
+        }
+        # A byte-identical statement read again lands on the same archive file: replace its entry.
+        account["statements"] = [s for s in account["statements"] if s["file"] != archived.name] + [record]
         return new
 
+    @staticmethod
+    def balance(account: dict) -> tuple[str | None, str | None]:
+        """The account balance and the day it holds for, or (None, None) while unknown.
+
+        The statement that lists transactions and ends last fixes the balance at its
+        end. A statement without transactions carries no balance, SCB prints none;
+        but if it follows on without a gap it proves that nothing moved, so the
+        balance holds until its end. Before any statement with a balance has been
+        read, the balance is unknown and nothing is made up.
+        """
+        known = [s for s in account["statements"] if s.get("closingBalance") is not None]
+        if not known:
+            return None, None
+        anchor = max(known, key=lambda s: (s["to"], s["read"]))
+        until = date.fromisoformat(anchor["to"])
+        quiet = [(date.fromisoformat(s["from"]), date.fromisoformat(s["to"]))
+                 for s in account["statements"] if s["rows"] == 0]
+        while later := [end for start, end in quiet if start <= until + timedelta(days=1) and end > until]:
+            until = max(later)
+        return anchor["closingBalance"], until.isoformat()
+
     def accounts(self) -> list[dict]:
-        return [
-            {
+        result = []
+        for number, account in sorted(self.data["accounts"].items()):
+            balance, until = self.balance(account)
+            result.append({
                 "accountNumber": number,
-                "owner": a["owner"],
-                "type": a["type"],
+                "owner": account["owner"],
+                "type": account["type"],
                 "currency": "THB",
-                "balance": a["balance"],
-                "balanceDate": a["balanceDate"],
-                "transactions": len(a["transactions"]),
-            }
-            for number, a in sorted(self.data["accounts"].items())
-        ]
+                "balance": balance,
+                "balanceDate": until,
+                "transactions": len(account["transactions"]),
+            })
+        return result
 
     def transactions(self, number: str, since: str) -> list[dict]:
         account = self.data["accounts"].get(number)
@@ -173,6 +217,7 @@ def refresh(store: Store, inbox: Path, password: str) -> dict:
             continue
         archived = archive(pdf, statement)
         new = store.absorb(statement, archived)
+        closing = statement.closing_balance
         processed.append({
             "file": pdf.name,
             "account": statement.account_number,
@@ -180,7 +225,7 @@ def refresh(store: Store, inbox: Path, password: str) -> dict:
             "to": statement.period_end.isoformat(),
             "rows": len(statement.rows),
             "new": new,
-            "closingBalance": f"{statement.closing_balance:.2f}",
+            "closingBalance": None if closing is None else f"{closing:.2f}",
             "archived": str(archived),
         })
         print(f"Read {pdf.name}: account {statement.account_number}, {statement.period_start} to "
@@ -238,8 +283,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
             account = self.store.data["accounts"].get(number)
             if account is None:
                 return self.reply(404, {"error": f"no statement read yet for account {number}"})
+            balance, until = self.store.balance(account)
             self.reply(200, {
-                "account": number, "balance": account["balance"], "balanceDate": account["balanceDate"],
+                "account": number, "balance": balance, "balanceDate": until,
                 "transactions": self.store.transactions(number, since),
             })
         else:
