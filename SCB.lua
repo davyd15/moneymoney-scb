@@ -1,12 +1,11 @@
 -- ============================================================
 -- MoneyMoney Web Banking Extension
 -- SCB (Siam Commercial Bank) Thailand: statement PDFs via local bridge
--- Version: 1.01
+-- Version: 1.02
 --
--- Changes in 1.01:
---  - Statements without transactions are accepted. SCB prints no balance on
---    them, so an account whose balance is not known yet says so instead of
---    showing a balance nobody has read from a statement.
+-- Changes in 1.02:
+--  - The protocol shows the bridge's start date: bookings before it are
+--    held back because they live in accounts kept by hand.
 -- ============================================================
 --
 -- SCB closed its internet banking in July 2023 and offers no API, so this
@@ -19,7 +18,7 @@
 -- never stored by the bridge.
 
 WebBanking {
-  version     = 1.01,
+  version     = 1.02,
   url         = "https://127.0.0.1:8766",
   services    = {"SCB Thailand (Statement PDF)"},
   description = "SCB (Siam Commercial Bank) Thailand: imports statement PDFs through a local bridge"
@@ -108,7 +107,8 @@ function InitializeSession(protocol, bankCode, username, reserved, password)
 
   local status, err = bridge("GET", "/__status__")
   if not status then return err end
-  print("SCB bridge " .. tostring(status.version) .. ", inbox " .. tostring(status.inbox))
+  local from = type(status.start) == "string" and (", bookings from " .. status.start) or ""
+  print("SCB bridge " .. tostring(status.version) .. ", inbox " .. tostring(status.inbox) .. from)
   if status.inboxError and status.inboxError ~= "" then
     return "The SCB bridge cannot read its inbox folder " .. tostring(status.inbox) .. " (" ..
       tostring(status.inboxError) .. "). Allow Python to access it under System Settings, Privacy, Files and Folders."

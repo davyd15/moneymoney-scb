@@ -78,9 +78,12 @@ class Row:
 
     @property
     def purpose(self) -> str:
+        """Description, note and booking time. The time keeps two otherwise identical
+        bookings on the same day apart, which MoneyMoney could discard as duplicates."""
         parts = [self.description]
         if self.note and self.note != "-":
             parts.append(f"Note: {self.note}")
+        parts.append(self.time)
         return " | ".join(p for p in parts if p)
 
     @property

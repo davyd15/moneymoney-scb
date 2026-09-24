@@ -96,7 +96,9 @@ class StatementTest(unittest.TestCase):
         self.assertEqual([r.amount for r in s.rows], [Decimal("-400.00"), Decimal("50.00")])
         self.assertEqual(s.closing_balance, Decimal("650.00"))
         self.assertEqual([r.name for r in s.rows], ["Mrs. Example Payee", "Test Person"])
-        self.assertEqual(s.rows[1].purpose, "NTRF123456       B/O Test Person | Note: rent")
+        self.assertEqual(s.rows[1].purpose, "NTRF123456       B/O Test Person | Note: rent | 17:22")
+        # The time keeps identical bookings on the same day apart.
+        self.assertEqual(s.rows[0].purpose, "Transfer to KBNK x1234 Mrs. Example Payee | 06:27")
 
     def test_statement_without_transactions_has_no_balance(self):
         s = parse_lines(lines(WITHOUT_ROWS))
@@ -158,6 +160,13 @@ class StoreBalanceTest(unittest.TestCase):
             self.store.absorb(parse_lines(lines(WITH_ROWS)), Path("busy.pdf"))
         self.assertEqual(len(self.account()["statements"]), 1)
         self.assertEqual(len(self.account()["transactions"]), 2)
+
+    def test_start_date_holds_back_older_bookings(self):
+        self.store.absorb(parse_lines(lines(WITH_ROWS)), Path("busy.pdf"))
+        dates = [t["bookingDate"] for t in self.store.transactions("123-456789-0", "1970-01-01", "2026-09-02")]
+        self.assertEqual(dates, ["2026-09-02"])
+        # The balance does not depend on the start date.
+        self.assertEqual(Store.balance(self.account()), ("650.00", "2026-09-10"))
 
     def test_store_of_bridge_1_0_is_migrated(self):
         path = Path(self.tmp.name) / "v1.json"

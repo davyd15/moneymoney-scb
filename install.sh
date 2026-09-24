@@ -4,6 +4,7 @@
 #
 #   ./install.sh                      inbox: ~/Library/Application Support/SCBBridge/inbox
 #   ./install.sh --inbox ~/Downloads  inbox: the folder your mail client saves attachments to
+#   ./install.sh --start 2026-09-12   deliver bookings from this day on only (kept for later installs)
 #
 # Installs the extension into MoneyMoney, the bridge into Application Support
 # and a LaunchAgent that starts the bridge on demand (socket activation). The
@@ -27,10 +28,12 @@ LABEL="com.moneymoney-scb.bridge"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 PORT=8766
 INBOX="$BRIDGE_DIR/inbox"
+START=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --inbox) INBOX="${2:?--inbox needs a folder}"; shift 2 ;;
+        --start) START="${2:?--start needs YYYY-MM-DD or off}"; shift 2 ;;
         *) die "Unknown argument: $1" ;;
     esac
 done
@@ -69,13 +72,26 @@ cp "$SCRIPT_DIR/scb_bridge.py" "$SCRIPT_DIR/scb_statement.py" "$BRIDGE_DIR/"
 ok "scb_bridge.py, scb_statement.py → $BRIDGE_DIR"
 ok "inbox: $INBOX"
 
-# ── 3. Certificate ───────────────────────────────────────────────────────────
+# ── 3. Start date ────────────────────────────────────────────────────────────
+step "Start date..."
+if [ -n "$START" ]; then
+    "$PYTHON" "$BRIDGE_DIR/scb_bridge.py" --set-start "$START" >/dev/null \
+        || die "Invalid --start $START (expected YYYY-MM-DD or off)"
+fi
+CURRENT_START="$("$PYTHON" -c 'import json, sys; print(json.load(open(sys.argv[1])).get("start") or "")' "$BRIDGE_DIR/config.json" 2>/dev/null || true)"
+if [ -n "$CURRENT_START" ]; then
+    ok "bookings from $CURRENT_START on (kept for later installs, change with --start)"
+else
+    ok "all bookings (no start date)"
+fi
+
+# ── 4. Certificate ───────────────────────────────────────────────────────────
 step "Certificate for https://127.0.0.1:$PORT..."
 "$PYTHON" "$BRIDGE_DIR/scb_bridge.py" --init-cert >/dev/null
 FINGERPRINT="$(openssl x509 -in "$BRIDGE_DIR/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
 ok "SHA-256 $FINGERPRINT"
 
-# ── 4. LaunchAgent with socket activation ────────────────────────────────────
+# ── 5. LaunchAgent with socket activation ────────────────────────────────────
 step "Installing LaunchAgent..."
 mkdir -p "$(dirname "$PLIST")"
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true

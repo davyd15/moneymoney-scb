@@ -26,7 +26,14 @@ for the account: SCB prints no balance on a statement without transactions.
 Data directory ~/Library/Application Support/SCBBridge/:
     store.json                          every booking ever read, by account and booking id
     statements/<account>/<from>_<to>.pdf processed statements
+    config.json                         the start date, see --set-start
     cert.pem, key.pem                   self-signed certificate for 127.0.0.1
+
+Start date: when you switch from accounts you kept by hand, set the first day
+the extension is responsible for (`--set-start 2026-09-12`, or install.sh
+--start). Bookings before it stay in the bridge's store, count for the balance
+and are never delivered, so MoneyMoney does not see them twice. The date lives
+in config.json and survives reinstalls.
 
 The PDF password arrives with each refresh request and is never written down.
 """
@@ -57,7 +64,7 @@ from urllib.parse import parse_qs, urlparse
 
 from scb_statement import Statement, StatementError, parse_pdf
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 PORT = 8766
 IDLE_TIMEOUT = 120  # seconds without a request before the bridge exits (launchd restarts it)
@@ -65,6 +72,7 @@ DATA_DIR = Path.home() / "Library" / "Application Support" / "SCBBridge"
 CERT_FILE = DATA_DIR / "cert.pem"
 KEY_FILE = DATA_DIR / "key.pem"
 STORE_FILE = DATA_DIR / "store.json"
+CONFIG_FILE = DATA_DIR / "config.json"
 STATEMENTS_DIR = DATA_DIR / "statements"
 DEFAULT_INBOX = DATA_DIR / "inbox"
 PATTERN = "AcctSt*.pdf"  # how the SCB EASY app names every statement, for every account
@@ -173,12 +181,28 @@ class Store:
             })
         return result
 
-    def transactions(self, number: str, since: str) -> list[dict]:
+    def transactions(self, number: str, since: str, start: str | None = None) -> list[dict]:
+        """Bookings from `since` on, and never from before the start date."""
         account = self.data["accounts"].get(number)
         if account is None:
             return []
-        rows = [t for t in account["transactions"].values() if t["bookingDate"] >= since]
+        first = max(since, start or since)
+        rows = [t for t in account["transactions"].values() if t["bookingDate"] >= first]
         return sorted(rows, key=lambda t: (t["bookingDate"], t["time"], t["id"]))
+
+
+def load_config() -> dict:
+    try:
+        return json.loads(CONFIG_FILE.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def save_config(config: dict) -> None:
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CONFIG_FILE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(config, indent=1) + "\n")
+    os.replace(tmp, CONFIG_FILE)
 
 
 # ── Statement intake ─────────────────────────────────────────────────────────
@@ -270,6 +294,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.reply(200, {
                 "ok": True, "version": __version__, "inbox": str(self.inbox),
                 "inboxError": inbox_error, "accounts": len(self.store.data["accounts"]),
+                "start": load_config().get("start"),
             })
         elif url.path == "/accounts":
             self.reply(200, {"accounts": self.store.accounts()})
@@ -286,7 +311,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
             balance, until = self.store.balance(account)
             self.reply(200, {
                 "account": number, "balance": balance, "balanceDate": until,
-                "transactions": self.store.transactions(number, since),
+                "transactions": self.store.transactions(number, since, load_config().get("start")),
             })
         else:
             self.reply(404, {"error": f"unknown path {url.path}"})
@@ -367,8 +392,20 @@ def main() -> int:
     parser.add_argument("--inbox", type=Path, default=DEFAULT_INBOX,
                         help=f"folder the statement PDFs arrive in (default: {DEFAULT_INBOX})")
     parser.add_argument("--init-cert", action="store_true", help="create the certificate and exit")
+    parser.add_argument("--set-start", metavar="YYYY-MM-DD|off",
+                        help="deliver only bookings from this day on (kept in config.json), 'off' removes it")
     parser.add_argument("--version", action="version", version=__version__)
     args = parser.parse_args()
+
+    if args.set_start:
+        config = load_config()
+        if args.set_start == "off":
+            config.pop("start", None)
+        else:
+            config["start"] = date.fromisoformat(args.set_start).isoformat()
+        save_config(config)
+        print(f"Start date: {config.get('start') or 'none'}")
+        return 0
 
     ensure_tls_cert()
     if args.init_cert:
