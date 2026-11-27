@@ -39,7 +39,7 @@ MoneyMoney ──refresh──▶ SCB.lua ──https://127.0.0.1:8766──▶ 
 
 Booking dates are anchored at 12:00 UTC so that a time zone change or a DST switch on the Mac never makes MoneyMoney import a day twice.
 
-HTTPS keeps the statement password encrypted even on the loopback interface, and a certificate issued for `127.0.0.1` fails for any other host name, which shuts out web pages trying DNS rebinding. MoneyMoney does not consult the macOS keychain for certificates: it asks once whether to trust the bridge's self-signed certificate and remembers its fingerprint.
+HTTPS keeps the statement password encrypted even on the loopback interface, and a certificate issued for `127.0.0.1` fails for any other host name, which shuts out web pages trying DNS rebinding. MoneyMoney lets macOS evaluate the certificate first and refuses one macOS does not trust, without asking. The installer therefore trusts the bridge's self-signed certificate for SSL in the login keychain (macOS asks for your password once). On top of that MoneyMoney asks once whether to trust the certificate and remembers its fingerprint.
 
 ## Installation
 
@@ -50,7 +50,7 @@ cd moneymoney-scb
 ./install.sh --start 2026-09-12       # optional, see "Switching from accounts you kept by hand"
 ```
 
-The installer copies `SCB.lua` into MoneyMoney's extensions folder and the bridge into `~/Library/Application Support/SCBBridge/`, creates the bridge's certificate for `127.0.0.1` once (it is kept on every later install, so MoneyMoney does not ask again) and loads a LaunchAgent (`com.moneymoney-scb.bridge`) with socket activation. It prints the certificate's SHA-256 fingerprint.
+The installer copies `SCB.lua` into MoneyMoney's extensions folder and the bridge into `~/Library/Application Support/SCBBridge/`, creates the bridge's certificate for `127.0.0.1` once (it is kept on every later install, so MoneyMoney does not ask again) and loads a LaunchAgent (`com.moneymoney-scb.bridge`) with socket activation. It trusts the certificate for SSL in the login keychain and prints its SHA-256 fingerprint.
 
 Then in MoneyMoney:
 
@@ -97,7 +97,7 @@ The fixtures are synthetic statements that copy the line structure of real ones 
 
 - No banking login, no PIN, no session with the bank. The bridge listens on 127.0.0.1 only and touches local files and nothing else.
 - The PDF password lives in MoneyMoney (extension) or in the macOS Keychain (command line), never in code, configuration or the bridge's store.
-- The bridge's certificate is self-signed for `127.0.0.1` (`CA:FALSE`, server authentication only) and is not added to the macOS keychain.
+- The bridge's certificate is self-signed for `127.0.0.1` (`CA:FALSE`, server authentication only) and is trusted for SSL in the login keychain only (removed again by `uninstall.sh`).
 - Statements and the booking store contain personal data and stay under `~/Library/Application Support/SCBBridge/`; the repository ignores `*.pdf`, `*.csv`, `*.plist` and `statements/`.
 
 ## Changelog

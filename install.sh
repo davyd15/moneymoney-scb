@@ -10,7 +10,8 @@
 # and a LaunchAgent that starts the bridge on demand (socket activation). The
 # bridge's self-signed certificate is created once and kept: MoneyMoney checks
 # certificates itself, asks once on the first refresh and remembers the
-# fingerprint. The macOS keychain plays no part in that. Safe to run again:
+# fingerprint, but only after macOS accepts the certificate, so the installer
+# also trusts it for SSL in the login keychain. Safe to run again:
 # everything is replaced in place.
 set -euo pipefail
 
@@ -90,6 +91,18 @@ step "Certificate for https://127.0.0.1:$PORT..."
 "$PYTHON" "$BRIDGE_DIR/scb_bridge.py" --init-cert >/dev/null
 FINGERPRINT="$(openssl x509 -in "$BRIDGE_DIR/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2)"
 ok "SHA-256 $FINGERPRINT"
+# MoneyMoney lets macOS evaluate the certificate first and refuses one macOS does
+# not trust ("rejected by macOS as invalid"), without asking. A self-signed
+# certificate only passes once the user trusts it for SSL. MoneyMoney then asks
+# once on top and remembers the fingerprint.
+if security verify-cert -c "$BRIDGE_DIR/cert.pem" -p ssl -s 127.0.0.1 -q >/dev/null 2>&1; then
+    ok "trusted by macOS for SSL"
+else
+    echo "  macOS will ask for your password to trust the certificate for SSL..."
+    security add-trusted-cert -r trustRoot -p ssl -k "$HOME/Library/Keychains/login.keychain-db" "$BRIDGE_DIR/cert.pem" \
+        && ok "trusted by macOS for SSL" \
+        || warn "Not trusted. Run: security add-trusted-cert -r trustRoot -p ssl -k ~/Library/Keychains/login.keychain-db \"$BRIDGE_DIR/cert.pem\""
+fi
 
 # ── 5. LaunchAgent with socket activation ────────────────────────────────────
 step "Installing LaunchAgent..."
