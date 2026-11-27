@@ -109,8 +109,11 @@ cat > "$PLIST" <<PLIST
         <string>--inbox</string>
         <string>$INBOX</string>
     </array>
+    <!-- Interactive, not Background: the bridge only works while MoneyMoney waits
+         for a refresh the user started. As a Background job its disk access is
+         throttled hardest, and under memory pressure its start stalled for minutes. -->
     <key>ProcessType</key>
-    <string>Background</string>
+    <string>Interactive</string>
     <!-- launchd holds port $PORT. The bridge starts on the first connection from
          MoneyMoney and exits after two minutes without requests. -->
     <key>Sockets</key>
